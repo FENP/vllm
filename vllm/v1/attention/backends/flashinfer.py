@@ -238,6 +238,9 @@ class FlashInferMetadata:
     qo_indptr_gpu: Optional[torch.Tensor] = None
     paged_kv_indptr_gpu: Optional[torch.Tensor] = None
 
+    # For context parallel
+    cp_kv_recover_idx: Optional[torch.Tensor] = None
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     cudagraph_support: ClassVar[AttentionCGSupport] = \
@@ -259,9 +262,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                      self.kv_cache_spec.block_size)
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
-        # full cuda graph理论上不影响CP，暂时关闭排除影响，后面可以打开
         self.enable_cuda_graph = (self.compilation_config.cudagraph_mode.\
-            decode_mode() == CUDAGraphMode.FULL and self.cp_world_size == 1)
+            decode_mode() == CUDAGraphMode.FULL)
         if self.enable_cuda_graph:
             # For full cudagraph capture, one `decode_wrapper` for each batch
             # size is needed for FlashInfer.
@@ -431,6 +433,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         seq_lens_np = seq_lens_cpu.numpy()
         block_table_tensor = common_attn_metadata.block_table_tensor
+        num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu
 
         if self.cp_world_size > 1:
             seq_lens_np[:num_decodes] = seq_lens_np[:num_decodes] // \
@@ -549,6 +552,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             use_cascade=use_cascade,
+            cp_kv_recover_idx=common_attn_metadata.cp_kv_recover_idx,
         )
 
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
@@ -595,39 +599,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 qo_indptr_cpu = qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[
                     prefill_start]
                 paged_kv_indptr_cpu = paged_kv_indptr_cpu[prefill_start:]
+                prefill_num_computed_tokens_cpu = num_computed_tokens_cpu[prefill_start:]
                 if not attn_metadata.prefill_use_trtllm:
                     if self.cp_world_size > 1:
-                        # 不考虑prefix cache和chunk prefill，all gather kv后
                         kv_indptr_cpu = qo_indptr_cpu * self.cp_world_size
                         # init custom mask for head-tail query order
                         mask_arr = []
-                        total_lens = seq_lens_cpu[prefill_start:
-                                        prefill_start + num_prefills
-                                        ].to(torch.int64).tolist()
-                        q_ids = common_attn_metadata.input_ids[1:]
+                        q_pos = common_attn_metadata.query_positions
                         for i in range(num_prefills):
                             # |----<C>-----|-<Q0>-|-<Q1>-|
-                            # |-----------<T>------------|
-                            # T = 12
-                            # Q = 2
+                            # |---<C+Q*cp_world_size>----|
                             # cp_world_size = 2
+                            # Q = 2
                             # C = 8
-                            # cur_q_ids = [0,3]
+                            # cur_q_pos = [0,3]
                             # context_mask_i.shape = (2, 8)
                             # upper = [0,1,2,3]
                             # local_mask_i = [[True, False, False, False], 
-                            #                 [True, True, True, True]], size=(2, 4)
+                            #                 [True, True, True, True]]
                             # mask_i.shape = (2, 12)
-                            cur_q_ids = q_ids[qo_indptr_cpu[i]:qo_indptr_cpu[i+1]]
-                            T = int(total_lens[i])
-                            Q = len(cur_q_ids)
-                            C = T - Q * self.cp_world_size
+                            cur_q_pos = torch.from_numpy(q_pos[qo_indptr_cpu[i]:qo_indptr_cpu[i+1]])
+                            Q = len(cur_q_pos)
+                            C = prefill_num_computed_tokens_cpu[i]
                             if Q <= 0:
                                 mask_arr.append(torch.zeros(0, dtype=torch.bool))
                                 continue
                             context_mask_i = torch.ones((Q, C), dtype=torch.bool)
                             upper = torch.arange(Q*self.cp_world_size)
-                            local_mask_i = (upper.unsqueeze(0) <= cur_q_ids.unsqueeze(1))
+                            local_mask_i = (upper.unsqueeze(0) <= cur_q_pos.unsqueeze(1))
                             mask_i = torch.cat([context_mask_i, local_mask_i], dim=1)
                             mask_arr.append(mask_i.flatten())
                         custom_mask = torch.cat(mask_arr, dim=0).to(self.device)
@@ -928,23 +927,22 @@ class FlashInferImpl(AttentionImpl):
             assert prefill_wrapper is not None
 
             if not attn_metadata.prefill_use_trtllm:
-                assert prefill_wrapper._causal
                 assert prefill_wrapper._window_left == self.window_left
                 assert prefill_wrapper._logits_soft_cap == (
                     self.logits_soft_cap or 0.0)
                 assert prefill_wrapper._sm_scale == self.scale
                 if self.cp_world_size > 1:
                     key_across_cp = get_cp_group().all_gather(
-                        key[num_decode_tokens:].contiguous())
+                        key[num_decode_tokens:].contiguous(), dim=0)
                     value_across_cp = get_cp_group().all_gather(
-                        value[num_decode_tokens:].contiguous())
+                        value[num_decode_tokens:].contiguous(), dim=0)
                     key_across_cp = torch.index_select(
                         key_across_cp, 0,
-                        attn_metadata.prefill.cp_kv_recover_idx
+                        attn_metadata.cp_kv_recover_idx
                     )
                     value_across_cp = torch.index_select(
                         value_across_cp, 0,
-                        attn_metadata.prefill.cp_kv_recover_idx
+                        attn_metadata.cp_kv_recover_idx
                     )
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
                         key_across_cp,
@@ -956,17 +954,14 @@ class FlashInferImpl(AttentionImpl):
                         layer._k_scale,
                         layer._v_scale,
                     )
-                    # TODO(qcs): 考虑 chunked prefill/ prefix cache 情况下
-                    # kvcache的获取与拼接
                     prefill_wrapper.run(
                         prefill_query,
                         key_across_cp,
                         value_across_cp,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
                         out=output[num_decode_tokens:],
                     )
                 else:
+                    assert prefill_wrapper._causal
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
@@ -1060,6 +1055,7 @@ class FlashInferImpl(AttentionImpl):
                         layer._v_scale,
                     )
 
+                    kv_cache_permute = kv_cache.permute(*stride_order)
                     out, lse = decode_wrapper.run(
                         decode_query,
                         kv_cache_permute,
